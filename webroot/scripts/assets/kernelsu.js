@@ -104,7 +104,7 @@ export function spawn(command, args = [], options = {}) {
             ksu.spawn(command, JSON.stringify(args), JSON.stringify(options), callbackName);
         } else {
             setTimeout(() => {
-                child.emit("error", "ksu is not defined");
+                child.stderr.emit("data", "ksu is not defined");
                 child.emit("exit", 1);
             }, 0);
         }
@@ -124,8 +124,10 @@ export function toast(message) {
     try {
         if (typeof ksu !== 'undefined') {
             ksu.toast(message);
+        } else {
+            console.log(message);
         }
     } catch (error) {   
-        // Silently fail for production
+        console.error("Error displaying toast:", error);
     }
 }

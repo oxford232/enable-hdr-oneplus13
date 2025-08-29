@@ -32,6 +32,33 @@
   position:relative;
 }
 
+/* 状态栏样式 */
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  min-height: 20px;
+}
+
+.status-bar #statusText {
+  font-size: 13px;
+  color: #9ca3af;
+  font-weight: 400;
+  text-align: center;
+  line-height: 1.4;
+  opacity: 0.85;
+}
+
+.status-bar #statusText:not(:empty) {
+  animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 0.85; }
+}
+
 /* 响应式设计 */
 @media (max-width:600px){
   .header .row{
@@ -46,5 +73,11 @@
   .header .search input{
     width:100%;
     min-width:0;
+  }
+  .status-bar {
+    padding: 6px 12px;
+  }
+  .status-bar #statusText {
+    font-size: 12px;
   }
 }

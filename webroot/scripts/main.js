@@ -1,6 +1,7 @@
 // ==== HDR WebUI main.js — Fast start + correct preselect ====
 // 用法：<script type="module" src="scripts/main.js"></script>
 import { exec, spawn, toast } from './assets/kernelsu.js';
+import { t, initI18n, applyI18n } from './i18n.js';
 
 const MODULE_DIR    = '/data/adb/modules/enable-hdr-oneplus13-webui';
 const APP_LIST_XMLS = [
@@ -26,12 +27,73 @@ let NEED_SORT_SELECTED = false; // 是否需要将已选应用排到前面
 let LABEL_CACHE = new Map(); // 内存中的应用名称缓存 pkg -> name
 let PERSISTENT_CACHE = new Map(); // 从文件读取的持久化缓存 pkg -> {name, timestamp}
 let CACHE_DIRTY = false; // 缓存是否有未保存的更改
+let AUTO_SAVE_ENABLED = true; // 是否启用自动保存功能
+
+// 状态栏管理
+let STATUS_BAR = {
+  totalApps: 0,
+  labeledApps: 0,
+  isFirstTime: false,
+  isChecking: false,
+  isCompleted: false,
+  failedApps: 0
+};
+
+// 超时和失败管理
+const MAX_RETRY_COUNT = 3; // 最大尝试次数
+const TIMEOUT_MS = 10000; // 10秒总超时
+const API_TIMEOUT_MS = 5000; // 单个API调用超时（5秒）
+let APP_RETRY_COUNT = new Map(); // pkg -> retry_count
+let APP_FIRST_ATTEMPT = new Map(); // pkg -> first_attempt_timestamp
+let FAILED_APPS = new Set(); // 记录获取失败的应用
+
+// API超时包装函数
+function withTimeout(promise, timeoutMs = API_TIMEOUT_MS) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('API_TIMEOUT')), timeoutMs)
+    )
+  ]);
+}
 
 // —— 工具 & 日志 ——
 const isPromise = (x) => !!x && typeof x.then === 'function';
 async function runExec(cmd, opts){
   try { const r = exec(cmd, opts); return isPromise(r) ? await r : r; }
   catch(e){ return { errno: 1, stdout: '', stderr: String(e) }; }
+}
+
+// 状态栏更新函数
+function updateStatusBar() {
+  const statusTextEl = document.getElementById('statusText');
+  if (!statusTextEl) return;
+
+  let message = '';
+  
+  if (STATUS_BAR.isCompleted) {
+    if (STATUS_BAR.failedApps > 0) {
+      message = t('statusCompleteWithFailed', { failedApps: STATUS_BAR.failedApps });
+    } else {
+      message = t('statusAllComplete');
+    }
+  } else if (STATUS_BAR.isFirstTime) {
+    if (STATUS_BAR.totalApps > 0) {
+      message = t('statusFirstTimeMatching', { labeledApps: STATUS_BAR.labeledApps, totalApps: STATUS_BAR.totalApps });
+    } else {
+      message = t('statusFirstTimeMatchingNoCount');
+    }
+  } else if (STATUS_BAR.isChecking) {
+    if (STATUS_BAR.totalApps > 0) {
+      message = t('statusCheckingChanges', { labeledApps: STATUS_BAR.labeledApps, totalApps: STATUS_BAR.totalApps });
+    } else {
+      message = t('statusCheckingChangesNoCount');
+    }
+  } else {
+    message = t('statusInitializing');
+  }
+
+  statusTextEl.textContent = message;
 }
 
 // ---------- logging ----------
@@ -88,7 +150,81 @@ chmod 0644 "${CACHE_PATH}"'`;
   }
 }
 
+// 初始化 appList_new.xml 文件（如果不存在则创建空文件）
+async function initAppListNewFile(){
+  try{
+    const APP_LIST_NEW_PATH = `${MODULE_DIR}/appList_new.xml`;
+    
+    // 检查文件是否存在
+    const checkResult = await runExec(`sh -c '[ -f "${APP_LIST_NEW_PATH}" ] && echo "exists" || echo "not_exists"'`);
+    const exists = (checkResult.stdout || '').trim() === 'exists';
+    
+    if (!exists) {
+      await fileLog('applist_new','init-create',{ path: APP_LIST_NEW_PATH });
+      
+      // 确保目录存在
+      await ensureCacheDir();
+      
+      // 创建空的 appList_new.xml 文件
+      const emptyContent = '';
+      const cmd = `sh -c 'cat > "${APP_LIST_NEW_PATH}" << "EOF"
+${emptyContent}
+EOF
+chmod 0644 "${APP_LIST_NEW_PATH}"'`;
+      
+      const r = await runExec(cmd);
+      if (r.errno === 0) {
+        await fileLog('applist_new','init-success',{ path: APP_LIST_NEW_PATH });
+      } else {
+        await fileLog('applist_new','init-error',{ errno: r.errno, stderr: r.stderr, path: APP_LIST_NEW_PATH });
+      }
+    } else {
+      await fileLog('applist_new','init-exists',{ path: APP_LIST_NEW_PATH });
+    }
+  }catch(e){
+    await fileLog('applist_new','init-exception',{ error: String(e) });
+  }
+}
+
+// 初始化 appList.xml 文件（如果不存在则创建空文件）
+async function initAppListFile(){
+  try{
+    const APP_LIST_PATH = `${MODULE_DIR}/appList.xml`;
+    
+    // 检查文件是否存在
+    const checkResult = await runExec(`sh -c '[ -f "${APP_LIST_PATH}" ] && echo "exists" || echo "not_exists"'`);
+    const exists = (checkResult.stdout || '').trim() === 'exists';
+    
+    if (!exists) {
+      await fileLog('applist','init-create',{ path: APP_LIST_PATH });
+      
+      // 确保目录存在
+      await ensureCacheDir();
+      
+      // 创建空的 appList.xml 文件
+      const emptyContent = '';
+      const cmd = `sh -c 'cat > "${APP_LIST_PATH}" << "EOF"
+${emptyContent}
+EOF
+chmod 0644 "${APP_LIST_PATH}"'`;
+      
+      const r = await runExec(cmd);
+      if (r.errno === 0) {
+        await fileLog('applist','init-success',{ path: APP_LIST_PATH });
+      } else {
+        await fileLog('applist','init-error',{ errno: r.errno, stderr: r.stderr, path: APP_LIST_PATH });
+      }
+    } else {
+      await fileLog('applist','init-exists',{ path: APP_LIST_PATH });
+    }
+  }catch(e){
+    await fileLog('applist','init-exception',{ error: String(e) });
+  }
+}
+
 async function loadPersistentCache(){
+  let cacheWasEmpty = true;
+  
   try{
     await fileLog('cache','load-start',{ path: CACHE_PATH });
     
@@ -100,7 +236,8 @@ async function loadPersistentCache(){
     
     if (!content) {
       await fileLog('cache','load-empty',{ path: CACHE_PATH });
-      return;
+      STATUS_BAR.isFirstTime = true;
+      return cacheWasEmpty;
     }
 
     // 尝试解析 JSON
@@ -110,7 +247,12 @@ async function loadPersistentCache(){
       
       // 验证数据格式并加载
       if (cacheData && typeof cacheData === 'object') {
-        for (const [pkg, info] of Object.entries(cacheData)) {
+        const entries = Object.entries(cacheData);
+        if (entries.length > 0) {
+          cacheWasEmpty = false;
+        }
+        
+        for (const [pkg, info] of entries) {
           if (info && typeof info === 'object' && info.name && typeof info.name === 'string') {
             PERSISTENT_CACHE.set(pkg, {
               name: info.name,
@@ -138,6 +280,12 @@ async function loadPersistentCache(){
   }catch(readError){
     await fileLog('cache','load-read-error',{ error: String(readError) });
   }
+  
+  // 设置状态：如果缓存为空则为首次加载，否则需要检查名称变化
+  STATUS_BAR.isFirstTime = cacheWasEmpty;
+  STATUS_BAR.isChecking = !cacheWasEmpty;
+  
+  return cacheWasEmpty;
 }
 
 // 确保缓存目录存在
@@ -453,6 +601,119 @@ async function loadSelectedFromXml(){
   await fileLog('loadSelected','complete',{ totalSelected: SELECTED.size, selectedApps: Array.from(SELECTED) });
 }
 
+// 实时保存选中状态到appList.xml和appList_new.xml（不显示toast通知）
+async function saveSelectedRealtime(){
+  const pkgs = Array.from(SELECTED);
+  
+  // --- 开始：旧逻辑，保存到 appList.xml ---
+  let existingContentOld = '';
+  let existingLinesOld = [];
+  let commentedAppsOld = new Set();
+  
+  try {
+    const r = await runExec(`sh -c 'cat \"${MODULE_DIR}/appList.xml\" 2>/dev/null'`);
+    existingContentOld = r.stdout || '';
+    existingLinesOld = existingContentOld.split('\n');
+    
+    for (const line of existingLinesOld) {
+      const trimmedLine = line.trim();
+      if (trimmedLine.startsWith('<!--') && trimmedLine.includes('-->')) {
+        const appMatch = trimmedLine.match(/<!--\s*<application\s+name=\"([^\"]+)\"\s*><\/application>\s*-->/);
+        if (appMatch && appMatch[1]) {
+          commentedAppsOld.add(appMatch[1]);
+        }
+      }
+    }
+  } catch (e) {
+    await fileLog('saveRealtime','read-old-error',{ error: String(e) });
+  }
+  
+  const newLinesOld = [];
+  for (const pkg of pkgs) {
+    newLinesOld.push(`<application name=\"${pkg}\"></application>`);
+  }
+  for (const commentedPkg of commentedAppsOld) {
+    if (!pkgs.includes(commentedPkg)) {
+      newLinesOld.push(`<!--<application name=\"${commentedPkg}\"></application>-->`);
+    }
+  }
+  
+  const payloadOld = newLinesOld.join('\n') + (newLinesOld.length > 0 ? '\n' : '');
+  const targetOld = `${MODULE_DIR}/appList.xml`;
+  const tmpOld = `${targetOld}.tmp`;
+  
+  const cmdOld =
+    `sh -c 'cat > \"${tmpOld}\" << "EOF"\n${payloadOld}EOF\n` +
+    `mv \"${tmpOld}\" \"${targetOld}\" && chmod 0644 \"${targetOld}\"'`;
+  
+  await runExec(cmdOld);
+  // --- 结束：旧逻辑 ---
+
+  // --- 开始：新逻辑，保存到 appList_new.xml ---
+  let existingContentNew = '';
+  let existingLinesNew = [];
+  let commentedAppsNew = new Set(); 
+
+  try {
+    const r = await runExec(`sh -c 'cat \"${MODULE_DIR}/appList_new.xml\" 2>/dev/null'`);
+    existingContentNew = r.stdout || '';
+    existingLinesNew = existingContentNew.split('\n');
+
+    for (const line of existingLinesNew) {
+      const trimmedLine = line.trim();
+      if (trimmedLine.startsWith('<!--') && trimmedLine.includes('-->')) {
+        // 修改正则表达式，更准确地匹配 <app>包名</app> 格式
+        const appMatch = trimmedLine.match(/<!--\s*<app>([^<]+)<\/app>\s*-->/);
+        if (appMatch && appMatch[1]) {
+          commentedAppsNew.add(appMatch[1].trim());
+        }
+      }
+      // 同时也要匹配非注释的 <app>包名</app> 行
+      else if (trimmedLine.startsWith('<app>') && trimmedLine.includes('</app>')) {
+        const appMatch = trimmedLine.match(/<app>([^<]+)<\/app>/);
+        if (appMatch && appMatch[1]) {
+          // 将这些包名也添加到注释集合中，因为我们要重新生成所有内容
+          commentedAppsNew.add(appMatch[1].trim());
+        }
+      }
+    }
+  } catch (e) {
+    await fileLog('saveRealtime','read-new-error',{ error: String(e) });
+  }
+
+  const newLinesNew = [];
+  for (const pkg of pkgs) {
+    newLinesNew.push(`<app>${pkg}</app>`);
+  }
+  for (const commentedPkg of commentedAppsNew) {
+    if (!pkgs.includes(commentedPkg)) {
+      newLinesNew.push(`<!--<app>${commentedPkg}</app>-->`);
+    }
+  }
+
+  const payloadNew = newLinesNew.join('\n') + (newLinesNew.length > 0 ? '\n' : '');
+  const targetNew = `${MODULE_DIR}/appList_new.xml`;
+  const tmpNew = `${targetNew}.tmp`;
+
+  const cmdNew =
+    `sh -c 'cat > \"${tmpNew}\" << "EOF"\n${payloadNew}EOF\n` +
+    `mv \"${tmpNew}\" \"${targetNew}\" && chmod 0644 \"${targetNew}\"'`;
+  
+  const rNew = await runExec(cmdNew);
+  // --- 结束：新逻辑 ---
+
+  await fileLog('saveRealtime','result',{
+    errno: rNew.errno,
+    selectedCount: pkgs.length,
+    commentedCount: commentedAppsOld.size + commentedAppsNew.size,
+    format: 'dual-file'
+  });
+  
+  if (rNew.errno !== 0) {
+    await fileLog('saveRealtime','error',{ stderr: rNew.stderr });
+  }
+}
+
 async function saveSelected() {
   const pkgs = Array.from(SELECTED);
   
@@ -462,14 +723,14 @@ async function saveSelected() {
   let commentedAppsOld = new Set();
   
   try {
-    const r = await runExec(`sh -c 'cat "${MODULE_DIR}/appList.xml" 2>/dev/null'`);
+    const r = await runExec(`sh -c 'cat \"${MODULE_DIR}/appList.xml\" 2>/dev/null'`);
     existingContentOld = r.stdout || '';
     existingLinesOld = existingContentOld.split('\n');
     
     for (const line of existingLinesOld) {
       const trimmedLine = line.trim();
       if (trimmedLine.startsWith('<!--') && trimmedLine.includes('-->')) {
-        const appMatch = trimmedLine.match(/<!--\s*<application\s+name="([^"]+)"\s*><\/application>\s*-->/);
+        const appMatch = trimmedLine.match(/<!--\s*<application\s+name=\"([^\"]+)\"\s*><\/application>\s*-->/);
         if (appMatch && appMatch[1]) {
           commentedAppsOld.add(appMatch[1]);
         }
@@ -481,11 +742,11 @@ async function saveSelected() {
   
   const newLinesOld = [];
   for (const pkg of pkgs) {
-    newLinesOld.push(`<application name="${pkg}"></application>`);
+    newLinesOld.push(`<application name=\"${pkg}\"></application>`);
   }
   for (const commentedPkg of commentedAppsOld) {
     if (!pkgs.includes(commentedPkg)) {
-      newLinesOld.push(`<!--<application name="${commentedPkg}"></application>-->`);
+      newLinesOld.push(`<!--<application name=\"${commentedPkg}\"></application>-->`);
     }
   }
   
@@ -494,12 +755,11 @@ async function saveSelected() {
   const tmpOld = `${targetOld}.tmp`;
   
   const cmdOld =
-    `sh -c 'cat > "${tmpOld}" << "EOF"\n${payloadOld}EOF\n` +
-    `mv "${tmpOld}" "${targetOld}" && chmod 0644 "${targetOld}"'`;
+    `sh -c 'cat > \"${tmpOld}\" << "EOF"\n${payloadOld}EOF\n` +
+    `mv \"${tmpOld}\" \"${targetOld}\" && chmod 0644 \"${targetOld}\"'`;
   
   await runExec(cmdOld);
   // --- 结束：旧逻辑 ---
-  
 
 // --- 开始：新逻辑，保存到 appList_new.xml (新增) ---
 let existingContentNew = '';
@@ -507,7 +767,7 @@ let existingLinesNew = [];
 let commentedAppsNew = new Set(); 
 
 try {
-  const r = await runExec(`sh -c 'cat "${MODULE_DIR}/appList_new.xml" 2>/dev/null'`);
+  const r = await runExec(`sh -c 'cat \"${MODULE_DIR}/appList_new.xml\" 2>/dev/null'`);
   existingContentNew = r.stdout || '';
   existingLinesNew = existingContentNew.split('\n');
 
@@ -548,8 +808,8 @@ const targetNew = `${MODULE_DIR}/appList_new.xml`;
 const tmpNew = `${targetNew}.tmp`;
 
 const cmdNew =
-  `sh -c 'cat > "${tmpNew}" << "EOF"\n${payloadNew}EOF\n` +
-  `mv "${tmpNew}" "${targetNew}" && chmod 0644 "${targetNew}"'`;
+  `sh -c 'cat > \"${tmpNew}\" << "EOF"\n${payloadNew}EOF\n` +
+  `mv \"${tmpNew}\" \"${targetNew}\" && chmod 0644 \"${targetNew}\"'`;
   
 const rNew = await runExec(cmdNew);
   // --- 结束：新逻辑 ---
@@ -565,11 +825,12 @@ const rNew = await runExec(cmdNew);
   });
   
   if (rNew.errno === 0) {
-    toast('保存完成，请重启手机以套用更变');
+    // 手动保存时显示提示
+    toast(t('savedToastNeedsReboot'));
     NEED_SORT_SELECTED = true;
     render(APPS);
   } else {
-    toast('保存失败');
+    toast(t('saveFailed'));
     await fileLog('save','error',{ stderr: rNew.stderr });
   }
 }
@@ -616,7 +877,7 @@ async function listPackagesFast(){
   return [];
 }
 
-// ---------- 快速通道拿应用名（不阻塞 UI） ——
+// ---------- 快速通道拿应用名（同步优先，异步为备选） ——
 function fastLabelByAPI(pkg){
   // 优先检查持久化缓存
   if (PERSISTENT_CACHE.has(pkg)) {
@@ -632,6 +893,7 @@ function fastLabelByAPI(pkg){
   
   let label = null;
   
+  // 尝试同步API调用（KernelSU）
   try{
     if (typeof window.ksu?.getPackagesInfo === 'function'){
       const info = JSON.parse(window.ksu.getPackagesInfo(`[${pkg}]`));
@@ -639,8 +901,11 @@ function fastLabelByAPI(pkg){
         label = String(info[0].appLabel);
       }
     }
-  }catch{}
+  }catch(e){
+    // KernelSU API 失败时静默处理
+  }
   
+  // 尝试同步API调用（PackageManager）
   if (!label) {
     try{
       if (typeof window.$packageManager !== 'undefined'){
@@ -650,10 +915,68 @@ function fastLabelByAPI(pkg){
           label = String(labelResult);
         }
       }
-    }catch{}
+    }catch(e){
+      // PackageManager API 失败时静默处理
+    }
   }
   
   // 如果获取到标签，更新缓存
+  if (label) {
+    updateCache(pkg, label);
+  }
+  
+  return label;
+}
+
+// 异步版本的快速API调用（带超时保护）
+async function fastLabelByAPIAsync(pkg){
+  // 先尝试同步版本
+  const syncResult = fastLabelByAPI(pkg);
+  if (syncResult) return syncResult;
+  
+  let label = null;
+  
+  try{
+    // KernelSU API with timeout
+    if (typeof window.ksu?.getPackagesInfo === 'function'){
+      const apiCall = new Promise((resolve) => {
+        try {
+          const info = JSON.parse(window.ksu.getPackagesInfo(`[${pkg}]`));
+          resolve(info?.[0]?.appLabel ? String(info[0].appLabel) : null);
+        } catch(e) {
+          resolve(null);
+        }
+      });
+      label = await withTimeout(apiCall, 3000);
+    }
+  }catch(e){
+    if (e.message !== 'API_TIMEOUT') {
+      await fileLog('api','ksu-error',{ pkg, error: String(e) });
+    }
+  }
+  
+  if (!label) {
+    try{
+      // PackageManager API with timeout
+      if (typeof window.$packageManager !== 'undefined'){
+        const apiCall = new Promise((resolve) => {
+          try {
+            const ai = window.$packageManager.getApplicationInfo(pkg, 0, 0);
+            const labelResult = ai?.getLabel?.();
+            resolve(labelResult ? String(labelResult) : null);
+          } catch(e) {
+            resolve(null);
+          }
+        });
+        label = await withTimeout(apiCall, 3000);
+      }
+    }catch(e){
+      if (e.message !== 'API_TIMEOUT') {
+        await fileLog('api','pm-error',{ pkg, error: String(e) });
+      }
+    }
+  }
+  
   if (label) {
     updateCache(pkg, label);
   }
@@ -695,9 +1018,12 @@ async function batchGetLabels(pkgs) {
             }
           });
           
-          // 批量更新缓存
+          // 批量更新缓存和状态
           if (cacheUpdates.size > 0) {
             batchUpdateCache(cacheUpdates);
+            // 更新状态栏（如果有应用被标记）
+            STATUS_BAR.labeledApps += cacheUpdates.size;
+            updateStatusBar();
           }
         }
       }
@@ -717,21 +1043,39 @@ async function batchGetLabels(pkgs) {
 
 // ---------- 慢通道（只对出现在视口的项尝试）：pm path → aapt → dumpsys —— 
 async function getApkPath(pkg){
-  const r = await runExec(`sh -c 'pm path "${pkg}" | grep -m 1 "base.apk" | cut -d: -f2'`);
-  return (r.stdout||'').trim();
+  try {
+    const r = await withTimeout(
+      runExec(`sh -c 'pm path "${pkg}" | grep -m 1 "base.apk" | cut -d: -f2'`),
+      3000 // 3秒超时
+    );
+    return (r.stdout||'').trim();
+  } catch(e) {
+    return '';
+  }
 }
 async function labelByAapt(pkg){
-  const apk = await getApkPath(pkg);
-  if (!apk) return '';
-  const aapt = await ensureAapt();
-  if (!aapt) return '';
-  const r = await runExec(`sh -c '${aapt} dump badging "${apk}" 2>/dev/null | grep -m 1 "application-label"'`);
-  if (r.errno===0 && r.stdout) {
-    const label = parseAaptLabel(r.stdout);
-    if (label) {
-      updateCache(pkg, label); // 更新缓存
+  try {
+    const apk = await getApkPath(pkg);
+    if (!apk) return '';
+    const aapt = await ensureAapt();
+    if (!aapt) return '';
+    
+    const r = await withTimeout(
+      runExec(`sh -c '${aapt} dump badging "${apk}" 2>/dev/null | grep -m 1 "application-label"'`),
+      5000 // 5秒超时
+    );
+    
+    if (r.errno===0 && r.stdout) {
+      const label = parseAaptLabel(r.stdout);
+      if (label) {
+        updateCache(pkg, label); // 更新缓存
+      }
+      return label;
     }
-    return label;
+  } catch(e) {
+    if (e.message !== 'API_TIMEOUT') {
+      await fileLog('api','aapt-error',{ pkg, error: String(e) });
+    }
   }
   return '';
 }
@@ -739,20 +1083,27 @@ async function labelByAapt(pkg){
 async function labelByDump(pkg){
   const tries = [ `dumpsys package "${pkg}"`, `pm dump "${pkg}"` ];
   for (const cmd of tries){
-    const r = await runExec(cmd);
-    if (r.errno===0 && r.stdout){
-      let m = r.stdout.match(/application-label:\s*(.*)/);
-      if (m && m[1]) {
-        const label = m[1].trim();
-        updateCache(pkg, label); // 更新缓存
-        return label;
+    try {
+      const r = await withTimeout(runExec(cmd), 4000); // 4秒超时
+      if (r.errno===0 && r.stdout){
+        let m = r.stdout.match(/application-label:\s*(.*)/);
+        if (m && m[1]) {
+          const label = m[1].trim();
+          updateCache(pkg, label); // 更新缓存
+          return label;
+        }
+        m = r.stdout.match(/label=([^\n]+)/);
+        if (m && m[1]) {
+          const label = m[1].trim();
+          updateCache(pkg, label); // 更新缓存
+          return label;
+        }
       }
-      m = r.stdout.match(/label=([^\n]+)/);
-      if (m && m[1]) {
-        const label = m[1].trim();
-        updateCache(pkg, label); // 更新缓存
-        return label;
+    } catch(e) {
+      if (e.message !== 'API_TIMEOUT') {
+        await fileLog('api','dump-error',{ pkg, cmd, error: String(e) });
       }
+      // 继续尝试下一个命令
     }
   }
   return '';
@@ -768,7 +1119,7 @@ function parseAaptLabel(output) {
 const LABEL_QUEUE = [];
 const LABEL_DONE  = new Set();
 let   LABEL_RUNNING = 0;
-const LABEL_CONCURRENCY = 8; // 增加并发数到8
+const LABEL_CONCURRENCY = 32; // 保持原来的32个并发
 
 async function labelWorker(){
   if (LABEL_RUNNING >= LABEL_CONCURRENCY) return;
@@ -778,18 +1129,90 @@ async function labelWorker(){
       const app = LABEL_QUEUE.shift();
       if (!app || app.labeled) continue;
 
+      // 检查是否已经失败过
+      if (FAILED_APPS.has(app.pkg)) {
+        // 使用传统命名方式
+        if (!app.labeled) {
+          const tail = app.pkg.split('.').pop() || app.pkg;
+          const fallbackName = tail.charAt(0).toUpperCase() + tail.slice(1);
+          app.name = fallbackName;
+          app.labeled = true;
+          
+          const row = document.querySelector(`.card[data-pkg="${app.pkg}"]`);
+          if (row){
+            const nameEl = row.querySelector('.name');
+            if (nameEl) nameEl.textContent = fallbackName;
+          }
+          
+          STATUS_BAR.labeledApps++;
+          updateStatusBar();
+        }
+        continue;
+      }
+
       // 首先检查缓存（持久化和内存）
       let label = null;
+      let fromCache = false;
       if (PERSISTENT_CACHE.has(app.pkg)) {
         const cached = PERSISTENT_CACHE.get(app.pkg);
         label = cached.name;
         LABEL_CACHE.set(app.pkg, label); // 同步到内存缓存
+        fromCache = true;
       } else if (LABEL_CACHE.has(app.pkg)) {
         label = LABEL_CACHE.get(app.pkg);
+        fromCache = true;
       }
 
       // 如果缓存中没有，尝试获取
       if (!label) {
+        const now = Date.now();
+        const currentRetryCount = APP_RETRY_COUNT.get(app.pkg) || 0;
+        
+        // 记录首次尝试时间
+        if (!APP_FIRST_ATTEMPT.has(app.pkg)) {
+          APP_FIRST_ATTEMPT.set(app.pkg, now);
+        }
+        
+        const firstAttemptTime = APP_FIRST_ATTEMPT.get(app.pkg);
+        const totalElapsed = now - firstAttemptTime;
+        
+        // 检查是否应该标记为失败：超过重试次数 OR 超过总时间限制
+        if (currentRetryCount >= MAX_RETRY_COUNT || totalElapsed > TIMEOUT_MS) {
+          // 标记为失败并使用传统命名
+          FAILED_APPS.add(app.pkg);
+          STATUS_BAR.failedApps++;
+          
+          const tail = app.pkg.split('.').pop() || app.pkg;
+          const fallbackName = tail.charAt(0).toUpperCase() + tail.slice(1);
+          app.name = fallbackName;
+          app.labeled = true;
+          
+          const row = document.querySelector(`.card[data-pkg="${app.pkg}"]`);
+          if (row){
+            const nameEl = row.querySelector('.name');
+            if (nameEl) nameEl.textContent = fallbackName;
+          }
+          
+          STATUS_BAR.labeledApps++;
+          updateStatusBar();
+          
+          const failureReason = currentRetryCount >= MAX_RETRY_COUNT ? 'max_retries' : 'timeout';
+          await fileLog('label','failed',{ 
+            pkg: app.pkg, 
+            retryCount: currentRetryCount, 
+            totalElapsed: totalElapsed,
+            reason: failureReason,
+            fallbackName: fallbackName 
+          });
+          
+          // 清理相关记录
+          APP_RETRY_COUNT.delete(app.pkg);
+          APP_FIRST_ATTEMPT.delete(app.pkg);
+          continue;
+        }
+        
+        APP_RETRY_COUNT.set(app.pkg, currentRetryCount + 1);
+        
         // 快速通道先试（一般足够快）
         label = fastLabelByAPI(app.pkg);
 
@@ -801,6 +1224,10 @@ async function labelWorker(){
       if (label && label !== app.name){
         app.name = label;
         app.labeled = true;
+        // 成功获取到标签，清除重试计数和时间记录
+        APP_RETRY_COUNT.delete(app.pkg);
+        APP_FIRST_ATTEMPT.delete(app.pkg);
+        
         const row = document.querySelector(`.card[data-pkg="${app.pkg}"]`);
         if (row){
           const nameEl = row.querySelector('.name');
@@ -808,14 +1235,23 @@ async function labelWorker(){
         }
         
         // 如果标签是新获取的（不是从缓存来的），更新缓存
-        if (!PERSISTENT_CACHE.has(app.pkg) || PERSISTENT_CACHE.get(app.pkg).name !== label) {
+        if (!fromCache) {
           updateCache(app.pkg, label);
         }
+        
+        STATUS_BAR.labeledApps++;
+        updateStatusBar();
+      } else if (!app.labeled && !fromCache) {
+        // 没有获取到标签，且不是从缓存来的，将其重新加入队列等待重试
+        LABEL_QUEUE.push(app);
       }
-      await fileLog('label','update',{ pkg: app.pkg, got: !!label, fromCache: PERSISTENT_CACHE.has(app.pkg) });
+      
+      await fileLog('label','update',{ pkg: app.pkg, got: !!label, fromCache: fromCache, retryCount: APP_RETRY_COUNT.get(app.pkg) || 0 });
     }
   } finally {
     LABEL_RUNNING--;
+    // 检查是否所有标签都已完成
+    setTimeout(checkLabelingComplete, 100);
   }
 }
 
@@ -825,6 +1261,168 @@ function runLabelWorkers(){
   while (LABEL_QUEUE.length > 0 && LABEL_RUNNING < LABEL_CONCURRENCY) {
     labelWorker();
   }
+}
+
+// 检查标签匹配是否完成
+function checkLabelingComplete() {
+  const allAppsLabeled = APPS.every(app => app.labeled);
+  const noWorkersRunning = LABEL_RUNNING === 0;
+  const queueEmpty = LABEL_QUEUE.length === 0;
+  
+  if (allAppsLabeled && noWorkersRunning && queueEmpty && !STATUS_BAR.isCompleted) {
+    STATUS_BAR.isCompleted = true;
+    STATUS_BAR.isFirstTime = false;
+    STATUS_BAR.isChecking = false;
+    updateStatusBar();
+    
+    // 延迟显示完成状态后，切换到实用提示
+    const completionDelay = STATUS_BAR.failedApps > 0 ? 5000 : 3000;
+    setTimeout(() => {
+      const statusTextEl = document.getElementById('statusText');
+      if (statusTextEl && STATUS_BAR.isCompleted) {
+        // 切换到实用提示信息
+        statusTextEl.textContent = t('statusRealtimeTip');
+        statusTextEl.style.opacity = '0.7'; // 稍微降低透明度表示这是提示信息
+      }
+    }, completionDelay);
+  }
+}
+
+// 死锁检测和恢复机制
+let lastProgressCount = 0;
+let lastProgressTime = Date.now();
+let deadlockCheckInterval = null;
+
+function setupDeadlockDetection() {
+  // 每10秒检查一次是否有死锁
+  deadlockCheckInterval = setInterval(async () => {
+    if (STATUS_BAR.isCompleted) {
+      clearInterval(deadlockCheckInterval);
+      return;
+    }
+    
+    const currentProgress = STATUS_BAR.labeledApps;
+    const now = Date.now();
+    
+    // 如果30秒内进度没有变化，认为可能存在死锁
+    if (currentProgress === lastProgressCount) {
+      if (now - lastProgressTime > 30000) { // 30秒无进展
+        await handleDeadlock();
+      }
+    } else {
+      // 进度有变化，更新记录
+      lastProgressCount = currentProgress;
+      lastProgressTime = now;
+    }
+    
+    // 检查单个应用是否处理时间过长
+    await checkStuckApps();
+    
+  }, 10000); // 10秒检查一次
+}
+
+async function handleDeadlock() {
+  await fileLog('deadlock','detected',{ 
+    labeledApps: STATUS_BAR.labeledApps, 
+    totalApps: STATUS_BAR.totalApps,
+    queueLength: LABEL_QUEUE.length,
+    runningWorkers: LABEL_RUNNING
+  });
+  
+  // 强制失败队列中最老的几个应用
+  const stuckApps = LABEL_QUEUE.splice(0, Math.min(5, LABEL_QUEUE.length));
+  for (const app of stuckApps) {
+    if (!app.labeled) {
+      FAILED_APPS.add(app.pkg);
+      STATUS_BAR.failedApps++;
+      
+      const tail = app.pkg.split('.').pop() || app.pkg;
+      const fallbackName = tail.charAt(0).toUpperCase() + tail.slice(1);
+      app.name = fallbackName;
+      app.labeled = true;
+      
+      const row = document.querySelector(`.card[data-pkg="${app.pkg}"]`);
+      if (row) {
+        const nameEl = row.querySelector('.name');
+        if (nameEl) nameEl.textContent = fallbackName;
+      }
+      
+      STATUS_BAR.labeledApps++;
+      
+      await fileLog('deadlock','force-failed',{ 
+        pkg: app.pkg, 
+        fallbackName: fallbackName 
+      });
+    }
+  }
+  
+  updateStatusBar();
+  
+  // 重新启动workers
+  setTimeout(() => {
+    runLabelWorkers();
+  }, 1000);
+}
+
+async function checkStuckApps() {
+  const now = Date.now();
+  const stuckApps = [];
+  
+  // 检查处理时间过长的应用
+  for (const [pkg, startTime] of APP_FIRST_ATTEMPT.entries()) {
+    if (now - startTime > 45000 && !FAILED_APPS.has(pkg)) { // 45秒还未完成
+      stuckApps.push(pkg);
+    }
+  }
+  
+  // 强制标记为失败
+  for (const pkg of stuckApps) {
+    const app = APP_MAP.get(pkg);
+    if (app && !app.labeled) {
+      FAILED_APPS.add(pkg);
+      STATUS_BAR.failedApps++;
+      
+      const tail = pkg.split('.').pop() || pkg;
+      const fallbackName = tail.charAt(0).toUpperCase() + tail.slice(1);
+      app.name = fallbackName;
+      app.labeled = true;
+      
+      const row = document.querySelector(`.card[data-pkg="${pkg}"]`);
+      if (row) {
+        const nameEl = row.querySelector('.name');
+        if (nameEl) nameEl.textContent = fallbackName;
+      }
+      
+      STATUS_BAR.labeledApps++;
+      
+      // 清理记录
+      APP_RETRY_COUNT.delete(pkg);
+      APP_FIRST_ATTEMPT.delete(pkg);
+      
+      await fileLog('deadlock','stuck-app-failed',{ 
+        pkg, 
+        totalElapsed: now - APP_FIRST_ATTEMPT.get(pkg), 
+        fallbackName 
+      });
+    }
+  }
+  
+  if (stuckApps.length > 0) {
+    updateStatusBar();
+  }
+}
+
+// 定期保存缓存的函数
+async function periodicCacheSave() {
+  if (CACHE_DIRTY) {
+    await savePersistentCache();
+  }
+}
+
+// 设置定期保存缓存
+function setupPeriodicCacheSave() {
+  // 每30秒检查一次是否需要保存缓存
+  setInterval(periodicCacheSave, 30000);
 }
 
 // ---------- 渲染 & 懒加载名称（IntersectionObserver） ——
@@ -889,7 +1487,7 @@ function render(apps){
 
     if (cb){
       cb.checked = SELECTED.has(app.pkg);  // 预勾选 ✅
-      cb.onchange = () => {
+      cb.onchange = async () => {
         if (cb.checked) {
           SELECTED.add(app.pkg);
         } else {
@@ -897,6 +1495,11 @@ function render(apps){
         }
         setCount(SELECTED.size, APPS.length);
         // 注意：这里不重新排序，只有保存和重新加载时才排序
+        
+        // 实时保存到XML文件
+        if (AUTO_SAVE_ENABLED) {
+          await saveSelectedRealtime();
+        }
       };
     }
 
@@ -922,19 +1525,33 @@ function applyFilter(){
 
 // ---------- 初始化 ---------- 
 async function init(){
+  // 初始化国际化
+  initI18n();
+  applyI18n();
+  
   // 每次启动时清除旧日志
   await clearLogOnStartup();
   
   await fileLog('init','start',{ ua:(navigator?.userAgent)||'', url:(location?.href)||'' });
+  
+  // 初始化状态栏
+  updateStatusBar();
+  
   showLoading(true);
   try{
-    // 1) 先加载持久化缓存
-    await loadPersistentCache();
+    // 1) 确保必要的文件存在（app_cache.json、appList.xml 和 appList_new.xml）
+    await initCacheFile();
+    await initAppListFile();
+    await initAppListNewFile();
 
-    // 2) 读取预勾选（XML）
+    // 2) 先加载持久化缓存（这会设置isFirstTime和isChecking状态）
+    const cacheWasEmpty = await loadPersistentCache();
+    updateStatusBar();
+
+    // 3) 读取预勾选（XML）
     await loadSelectedFromXml();
 
-    // 3) 秒拿包名并渲染（标题优先用缓存，否则用包名尾段）
+    // 4) 秒拿包名并渲染（标题优先用缓存，否则用包名尾段）
     const pkgs = await listPackagesFast();
     APPS = pkgs.map(pkg => {
       let name;
@@ -951,13 +1568,16 @@ async function init(){
       }
     });
 
-    // 更新应用映射
+    // 更新应用映射和状态栏总数
     APPS.forEach(app => APP_MAP.set(app.pkg, app));
+    STATUS_BAR.totalApps = APPS.length;
+    STATUS_BAR.labeledApps = APPS.filter(app => app.labeled).length;
+    updateStatusBar();
     
-    // 4) 重新加载时需要排序
+    // 5) 重新加载时需要排序
     NEED_SORT_SELECTED = true;
     
-    // 5) 对于未缓存的应用，尝试批量获取前50个的名称
+    // 6) 对于未缓存的应用，尝试批量获取前50个的名称
     const unlabeledApps = APPS.filter(app => !app.labeled);
     const firstBatch = unlabeledApps.slice(0, 50);
     if (firstBatch.length > 0) {
@@ -972,10 +1592,10 @@ async function init(){
       });
     }
     
-    // 6) 渲染列表（此时 SELECTED 已经包含了从 XML 读取的数据）
+    // 7) 渲染列表（此时 SELECTED 已经包含了从 XML 读取的数据）
     render(APPS);
 
-    // 7) 立即设置菜单交互（最高优先级）
+    // 8) 立即设置菜单交互（最高优先级）
     await fileLog('menu','setup-start');
     try {
       await setupMenuInteractions();
@@ -984,7 +1604,7 @@ async function init(){
       await fileLog('menu','setup-error',{ error: String(e) });
     }
 
-    // 8) 延迟处理剩余未标记的应用（低优先级）
+    // 9) 延迟处理剩余未标记的应用（低优先级）
     setTimeout(() => {
       const remaining = APPS.filter(app => !app.labeled);
       if (remaining.length > 0) {
@@ -993,7 +1613,7 @@ async function init(){
       }
     }, 500); // 延迟500ms，让菜单优先设置
     
-    // 8) 对于前100个应用中未缓存的，立即尝试快速API
+    // 10) 对于前100个应用中未缓存的，立即尝试快速API
     setTimeout(async () => {
       const quickBatch = APPS.slice(0, 100).filter(app => !app.labeled);
       const cacheUpdates = new Map();
@@ -1014,9 +1634,11 @@ async function init(){
         }
       }
       
-      // 批量更新缓存
+      // 批量更新缓存和状态
       if (cacheUpdates.size > 0) {
         batchUpdateCache(cacheUpdates);
+        // 注意：这里不需要再次更新STATUS_BAR.labeledApps，因为在updateCache中会处理
+        updateStatusBar();
       }
       
     }, 500); // 500ms后开始快速标记，确保菜单优先设置
@@ -1029,11 +1651,26 @@ async function init(){
       uncachedCount: APPS.length - cachedCount
     });
     
-    // 9) 设置缓存自动保存和清理
+    // 11) 设置缓存自动保存和清理
     setupCacheAutoSave();
+    setupPeriodicCacheSave(); // 设置定期保存缓存
     
-    // 10) 清理缓存中不存在的应用（延迟执行，避免阻塞UI）
+    // 12) 清理缓存中不存在的应用（延迟执行，避免阻塞UI）
     setTimeout(() => cleanupCache(), 5000);
+    
+    // 13) 设置定期检查标签完成状态
+    const completionCheckInterval = setInterval(() => {
+      checkLabelingComplete();
+      if (STATUS_BAR.isCompleted) {
+        clearInterval(completionCheckInterval);
+      }
+    }, 1000);
+    
+    // 初始检查（如果所有应用都已从缓存加载）
+    setTimeout(checkLabelingComplete, 500);
+    
+    // 启动死锁检测机制
+    setupDeadlockDetection();
     
   }catch(e){
     await fileLog('init','error',{ error: String(e) });
@@ -1060,18 +1697,28 @@ async function init(){
   
   const sa = $('selectAll'); 
   if (sa) {
-    const selectAllHandler = () => { 
+    const selectAllHandler = async () => { 
       APPS.forEach(a=>SELECTED.add(a.pkg)); 
       applyFilter(); 
+      // 实时保存到XML文件
+      if (AUTO_SAVE_ENABLED) {
+        await saveSelectedRealtime();
+      }
+      toast(t('selectAllComplete'));
     };
     sa.addEventListener('click', selectAllHandler);
   }
   
   const da = $('deselectAll'); 
   if (da) {
-    const deselectAllHandler = () => { 
+    const deselectAllHandler = async () => { 
       SELECTED.clear(); 
       applyFilter(); 
+      // 实时保存到XML文件
+      if (AUTO_SAVE_ENABLED) {
+        await saveSelectedRealtime();
+      }
+      toast(t('deselectAllComplete'));
     };
     da.addEventListener('click', deselectAllHandler);
   }

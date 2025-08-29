@@ -20,7 +20,7 @@ fi
 
 ui_print "=============================================="
 ui_print " Enable HDR for OnePlus 13 (WebUI)"
-ui_print " Version: v1.3"
+ui_print " Version: v1.5.0"
 ui_print " Author: Oxford,HoneyWhiteCloud,FTReey@coolapk"
 ui_print "=============================================="
 
