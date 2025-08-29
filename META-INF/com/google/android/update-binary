@@ -21,7 +21,7 @@ fi
 ui_print "=============================================="
 ui_print " Enable HDR for OnePlus 13 (WebUI)"
 ui_print " Version: v1.3"
-ui_print " Author: Oxford"
+ui_print " Author: Oxford,HoneyWhiteCloud,FTReey@coolapk"
 ui_print "=============================================="
 
 DEVICE_BRAND=`getprop ro.product.brand`
