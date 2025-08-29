@@ -453,73 +453,124 @@ async function loadSelectedFromXml(){
   await fileLog('loadSelected','complete',{ totalSelected: SELECTED.size, selectedApps: Array.from(SELECTED) });
 }
 
-async function saveSelected(){
+async function saveSelected() {
   const pkgs = Array.from(SELECTED);
-
-  // 读取现有文件，保留注释和格式
-  let existingContent = '';
-  let existingLines = [];
-  let commentedApps = new Set(); // 记录被注释的应用
+  
+  // --- 开始：旧逻辑，保存到 appList.xml (维持原样) ---
+  let existingContentOld = '';
+  let existingLinesOld = [];
+  let commentedAppsOld = new Set();
   
   try {
     const r = await runExec(`sh -c 'cat "${MODULE_DIR}/appList.xml" 2>/dev/null'`);
-    existingContent = r.stdout || '';
-    existingLines = existingContent.split('\n');
+    existingContentOld = r.stdout || '';
+    existingLinesOld = existingContentOld.split('\n');
     
-    // 查找被注释的应用
-    for (const line of existingLines) {
+    for (const line of existingLinesOld) {
       const trimmedLine = line.trim();
-      if (trimmedLine.startsWith('<!--') && trimmedLine.includes('<application name=')) {
-        const match = trimmedLine.match(/<!--\s*<application\s+name="([^"]+)"/);
-        if (match && match[1]) {
-          commentedApps.add(match[1].trim());
+      if (trimmedLine.startsWith('<!--') && trimmedLine.includes('-->')) {
+        const appMatch = trimmedLine.match(/<!--\s*<application\s+name="([^"]+)"\s*><\/application>\s*-->/);
+        if (appMatch && appMatch[1]) {
+          commentedAppsOld.add(appMatch[1]);
         }
       }
     }
-  } catch(e) {
-    await fileLog('save','read-existing-failed',{ error: String(e) });
+  } catch (e) {
+    console.error('Error reading old appList.xml:', e);
   }
-
-  // 生成新的文件内容
-  const newLines = [];
   
-  // 1. 先添加所有选中的应用（活跃状态）
+  const newLinesOld = [];
   for (const pkg of pkgs) {
-    newLines.push(`<application name="${pkg}"></application>`);
+    newLinesOld.push(`<application name="${pkg}"></application>`);
   }
-  
-  // 2. 再添加被注释的应用（保持注释状态）
-  for (const pkg of commentedApps) {
-    if (!pkgs.includes(pkg)) { // 只有当应用没有被重新选中时才保持注释状态
-      newLines.push(`<!-- <application name="${pkg}"></application> -->`);
+  for (const commentedPkg of commentedAppsOld) {
+    if (!pkgs.includes(commentedPkg)) {
+      newLinesOld.push(`<!--<application name="${commentedPkg}"></application>-->`);
     }
   }
   
-  const payload = newLines.join('\n') + (newLines.length > 0 ? '\n' : '');
+  const payloadOld = newLinesOld.join('\n') + (newLinesOld.length > 0 ? '\n' : '');
+  const targetOld = `${MODULE_DIR}/appList.xml`;
+  const tmpOld = `${targetOld}.tmp`;
   
-  const target = `${MODULE_DIR}/appList.xml`;
-  const tmp    = `${target}.tmp`;
+  const cmdOld =
+    `sh -c 'cat > "${tmpOld}" << "EOF"\n${payloadOld}EOF\n` +
+    `mv "${tmpOld}" "${targetOld}" && chmod 0644 "${targetOld}"'`;
+  
+  await runExec(cmdOld);
+  // --- 结束：旧逻辑 ---
+  
 
-  const cmd =
-    `sh -c 'cat > "${tmp}" << "EOF"\n${payload}EOF\n` +
-    `mv "${tmp}" "${target}" && chmod 0644 "${target}"'`;
+// --- 开始：新逻辑，保存到 appList_new.xml (新增) ---
+let existingContentNew = '';
+let existingLinesNew = [];
+let commentedAppsNew = new Set(); 
 
-  const r = await runExec(cmd);
-  await fileLog('save','result',{ 
-    errno: r.errno, 
-    selectedCount: pkgs.length, 
-    commentedCount: commentedApps.size,
-    format: 'line-by-line' 
+try {
+  const r = await runExec(`sh -c 'cat "${MODULE_DIR}/appList_new.xml" 2>/dev/null'`);
+  existingContentNew = r.stdout || '';
+  existingLinesNew = existingContentNew.split('\n');
+
+  for (const line of existingLinesNew) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.startsWith('<!--') && trimmedLine.includes('-->')) {
+      // 修改正则表达式，更准确地匹配 <app>包名</app> 格式
+      const appMatch = trimmedLine.match(/<!--\s*<app>([^<]+)<\/app>\s*-->/);
+      if (appMatch && appMatch[1]) {
+        commentedAppsNew.add(appMatch[1].trim());
+      }
+    }
+    // 同时也要匹配非注释的 <app>包名</app> 行
+    else if (trimmedLine.startsWith('<app>') && trimmedLine.includes('</app>')) {
+      const appMatch = trimmedLine.match(/<app>([^<]+)<\/app>/);
+      if (appMatch && appMatch[1]) {
+        // 将这些包名也添加到注释集合中，因为我们要重新生成所有内容
+        commentedAppsNew.add(appMatch[1].trim());
+      }
+    }
+  }
+} catch (e) {
+  console.error('Error reading new appList_new.xml:', e);
+}
+
+const newLinesNew = [];
+for (const pkg of pkgs) {
+  newLinesNew.push(`<app>${pkg}</app>`);
+}
+for (const commentedPkg of commentedAppsNew) {
+  if (!pkgs.includes(commentedPkg)) {
+    newLinesNew.push(`<!--<app>${commentedPkg}</app>-->`);
+  }
+}
+
+const payloadNew = newLinesNew.join('\n') + (newLinesNew.length > 0 ? '\n' : '');
+const targetNew = `${MODULE_DIR}/appList_new.xml`;
+const tmpNew = `${targetNew}.tmp`;
+
+const cmdNew =
+  `sh -c 'cat > "${tmpNew}" << "EOF"\n${payloadNew}EOF\n` +
+  `mv "${tmpNew}" "${targetNew}" && chmod 0644 "${targetNew}"'`;
+  
+const rNew = await runExec(cmdNew);
+  // --- 结束：新逻辑 ---
+
+
+  // --- 统一的日志和 UI 反馈 ---
+  // 这里可以只用新文件的保存结果来决定是否成功
+  await fileLog('save','result',{
+    errno: rNew.errno,
+    selectedCount: pkgs.length,
+    commentedCount: commentedAppsOld.size + commentedAppsNew.size,
+    format: 'dual-file'
   });
   
-  if (r.errno === 0) {
+  if (rNew.errno === 0) {
     toast('保存完成，请重启手机以套用更变');
-    // 保存后需要重新排序，将已选应用排到前面
     NEED_SORT_SELECTED = true;
     render(APPS);
   } else {
     toast('保存失败');
-    await fileLog('save','error',{ stderr: r.stderr });
+    await fileLog('save','error',{ stderr: rNew.stderr });
   }
 }
 
@@ -1033,5 +1084,6 @@ async function init(){
     sv.addEventListener('click', saveHandler);
   }
 }
+
 
 document.addEventListener('DOMContentLoaded', () => { init(); });
