@@ -1,0 +1,53 @@
+#!/sbin/sh
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+# Load utility functions
+[ -f /data/adb/magisk/util_functions.sh ] && . /data/adb/magisk/util_functions.sh
+[ $MAGISK_VER_CODE -gt 18100 ] && require_new_magisk || require_new_api
+
+if $BOOTMODE; then
+  ui_print "- Installing from Magisk app"
+else
+  ui_print "*********************************************************"
+  ui_print " Please install this module via Magisk app"
+  ui_print "*********************************************************"
+  abort
+fi
+
+ui_print "=============================================="
+ui_print " Enable HDR for OnePlus 13 (WebUI)"
+ui_print " Version: v1.5.0"
+ui_print " Author: Oxford,HoneyWhiteCloud,FTReey@coolapk"
+ui_print "=============================================="
+
+DEVICE_BRAND=`getprop ro.product.brand`
+DEVICE_MODEL=`getprop ro.product.model`
+ui_print "- Device: $DEVICE_BRAND $DEVICE_MODEL"
+
+ui_print "- Extracting module files"
+unzip -o "$ZIPFILE" -x 'META-INF/*' -d $MODPATH >&2
+
+ui_print "- Setting permissions"
+set_perm_recursive $MODPATH 0 0 0755 0644
+set_perm_recursive $MODPATH/system 0 0 0755 0644
+set_perm $MODPATH/service.sh 0 0 0755
+set_perm $MODPATH/post-fs-data.sh 0 0 0755
+set_perm $MODPATH/uninstall.sh 0 0 0755
+
+ui_print "- Creating system overlay structure"
+mkdir -p $MODPATH/system/my_product/vendor/etc
+touch $MODPATH/system/my_product/vendor/etc/.replace
+
+if [ -d "$MODPATH/webroot" ]; then
+    ui_print "- Setting up WebUI"
+    set_perm_recursive $MODPATH/webroot 0 0 0755 0644
+    ui_print "  WebUI available at: /data/adb/modules/enable-hdr-oneplus13-webui/webroot/"
+fi
+
+ui_print "- Installation completed"
+ui_print "- Please reboot your device"
+ui_print "=============================================="
