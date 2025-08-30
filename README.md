@@ -1,4 +1,4 @@
-**其他语言版本: [English](README.md), [中文](README_CN.md).**
+**其他语言版本: [中文](README_CN.md).**
 
 
 # Enable HDR on OnePlus 13 with WebUI
@@ -43,6 +43,7 @@ How to use it?
 4. Choose the enable-hdr-oneplus13-webui.zip file and install it.
 5. After installation, reboot your device for the module to take effect.
 6. Open the WebUI to customize the app list.
+
 
 
 
