@@ -1,3 +1,6 @@
+**Read this in other languages: [English](README.md), [中文](README_zh.md).**
+
+
 # 在 OnePlus 13 上启用 HDR (支持 WebUI)
 
 这是什么?
@@ -40,3 +43,4 @@ WebUI
 4. 选择下载好的 zip 并安装。
 5. 安装完成后重启设备即可生效。
 6. 可选:通过 WebUI 自定义应用列表。
+
